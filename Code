@@ -1,0 +1,912 @@
+import os
+import math
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from matplotlib.patches import Polygon
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.distributions import Normal
+import gymnasium as gym
+from gymnasium import spaces
+
+os.makedirs('outputs', exist_ok=True)
+
+class StraightLineFishEnv(gym.Env):
+    """改进版：强化纠偏机制"""
+    metadata = {"render_modes": ["human"], "render_fps": 30}
+
+    def __init__(self, num_segments=5, body_length=0.8):
+        super().__init__()
+
+        # Geometry - 纺锤型身体
+        self.num_segments = int(num_segments)
+        self.segment_ratios = [0.15, 0.20, 0.18, 0.20, 0.27][:self.num_segments]
+        self.segment_lengths = [r * body_length for r in self.segment_ratios]
+        self.body_length = sum(self.segment_lengths)
+
+        self.body_width_ratios = self._compute_width_ratios()
+        self.max_body_width = 0.14
+        self.center_of_mass_offset = self.body_length / 2.0
+
+        # Wave parameters
+        self.frequency = 2.0
+        self.base_amplitude = 0.35
+        self.wave_length = 0.8 * self.body_length
+
+        # Dynamics parameters
+        self.dt = 0.05
+        self.max_steps = 800
+        self.mass = 1.0
+        self.inertia = 0.2
+        self.water_drag_linear = 1.5
+        self.angular_damping = 1.2
+        self.thrust_k_forward = -2.5
+        self.thrust_k_side = 1.0
+        self.tail_lever = self.body_length * 0.8
+
+        # Limits
+        self.max_speed = 1.5
+        self.max_omega = 2.0
+
+        # Action & Observation
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
+        # 增强观测：添加历史偏差信息
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(13,), dtype=np.float32)
+
+        # 目标直线
+        self.target_line_x = 0.0
+
+        # 新增：跟踪偏差历史
+        self.prev_lateral_deviation = 0.0
+        self.time_in_perfect_zone = 0
+
+        self.reset()
+
+    def _compute_width_ratios(self):
+        """纺锤形宽度分布"""
+        if self.num_segments == 5:
+            return [0.5, 0.85, 0.75, 0.6, 0.25]
+        elif self.num_segments == 4:
+            return [0.6, 1.0, 0.7, 0.3]
+        else:
+            return [1.0 - i/(self.num_segments-1) * 0.75 for i in range(self.num_segments)]
+
+    def _get_body_center_global(self):
+        """计算身体中心的全局坐标"""
+        cos_o, sin_o = math.cos(self.orientation), math.sin(self.orientation)
+        center_offset_vec = self.center_of_mass_offset * np.array([cos_o, sin_o])
+        return self.position + center_offset_vec
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+
+        # 增加初始扰动范围，让智能体学会从更大偏差恢复
+        x_offset = np.random.uniform(-0.3, 0.3)
+        self.position = np.array([x_offset, 0.0])
+
+        angle_offset = np.random.uniform(-0.2, 0.2)
+        self.orientation = math.pi / 2.0 + angle_offset
+
+        self.velocity = np.zeros(2)
+        self.omega = 0.0
+        self.wave_phase = 0.0
+        self.step_count = 0
+
+        self.body_center = self._get_body_center_global()
+        self.trajectory = [self.body_center.copy()]
+
+        # 重置跟踪变量
+        self.prev_lateral_deviation = self.body_center[0] - self.target_line_x
+        self.time_in_perfect_zone = 0
+
+        lateral_deviation = self.prev_lateral_deviation
+        self.lateral_history = [lateral_deviation]*5  # 长度固定5
+
+        return self._get_obs(), {}
+
+    def _get_obs(self):
+        """增强观测空间 - 包含纠偏信息"""
+        center_pos = self._get_body_center_global()
+
+        # 横向偏差
+        lateral_deviation = center_pos[0] - self.target_line_x
+
+        # 朝向误差
+        target_orientation = -math.pi / 2.0
+        orientation_error = self.orientation - target_orientation
+        orientation_error = (orientation_error + math.pi) % (2 * math.pi) - math.pi
+
+        # 前进方向
+        forward_dir = np.array([math.cos(self.orientation), math.sin(self.orientation)])
+        y_direction = np.array([0.0, 1.0])
+        alignment = np.dot(forward_dir, y_direction)
+
+        # 新增：偏差变化率（判断是否在纠偏）
+        deviation_change = lateral_deviation - self.prev_lateral_deviation
+
+        # 新增：是否在perfect zone内
+        in_perfect_zone = 1.0 if abs(lateral_deviation) < 0.1 else 0.0
+
+        obs = np.array([
+            lateral_deviation,
+            orientation_error,
+            self.velocity[0],
+            self.velocity[1],
+            self.omega,
+            alignment,
+            deviation_change,
+            in_perfect_zone,
+            *self.lateral_history  # 最近5步历史偏差
+        ], dtype=np.float32)
+
+        return obs
+
+    def _body_wave_angles(self, amplitude, bias):
+        """计算关节角"""
+        joint_angles = []
+        omega = 2 * np.pi * self.frequency
+        wave_number = 2 * np.pi / self.wave_length
+
+        current_s_pos = 0.0
+        for i in range(self.num_segments):
+            current_s_pos += self.segment_lengths[i] / self.body_length
+            s = current_s_pos
+
+            env_amp = amplitude * (s ** 2)
+            bias_term = bias * (i / max(1, (self.num_segments - 1))) * 0.5
+
+            phase = wave_number * s * self.body_length
+            angle = env_amp * np.sin(phase + omega * self.wave_phase) + bias_term
+            joint_angles.append(angle)
+
+        return np.array(joint_angles)
+
+    def _body_positions(self, joint_angles):
+        """计算鱼体各关节位置"""
+        positions = [self.position.copy()]
+        current_angle = self.orientation
+
+        for i, a in enumerate(joint_angles):
+            current_angle += a
+            L = self.segment_lengths[i]
+            nxt = positions[-1] + L * np.array([math.cos(current_angle), math.sin(current_angle)])
+            positions.append(nxt)
+
+        return np.array(positions)
+
+    def step(self, action):
+        self.step_count += 1
+        a = np.clip(action, -1.0, 1.0)
+        amp_scale = float(a[0])
+        bias = float(a[1])
+
+        # Warm-start heuristic: 前30步快速侧向探索
+        center_pos = self._get_body_center_global()
+        lateral_deviation = center_pos[0] - self.target_line_x
+        if self.step_count <= 30:
+            bias = -np.sign(lateral_deviation) * 0.5  # 向中心线施加side-force
+            amp_scale = 0.2  # 小幅波动
+
+        # 映射动作到幅值
+        amplitude = self.base_amplitude * (1.0 + 0.9 * amp_scale)
+        amplitude = max(0.01, amplitude)
+
+        # 更新波相位
+        self.wave_phase += self.dt
+
+        # 计算尾部运动产生的力
+        amp_tail = amplitude * (1.0 ** 2)
+        forward_thrust = self.thrust_k_forward * (amp_tail ** 2)
+        bias_scale = 0.6
+        side_force = self.thrust_k_side * amp_tail * (bias * bias_scale)
+
+        # 全局方向向量
+        forward_dir = np.array([math.cos(self.orientation), math.sin(self.orientation)])
+        lateral_dir = np.array([-forward_dir[1], forward_dir[0]])
+        F = forward_thrust * forward_dir + side_force * lateral_dir
+
+        # 计算尾部位置（更物理）
+        joint_angles = self._body_wave_angles(amplitude, bias)
+        positions = self._body_positions(joint_angles)
+        tail_pos = positions[-1]  # 全局坐标尾点
+        # 质心（body_center）已经有
+        r_tail = tail_pos - self.body_center  # 从质心指向尾部的向量
+
+        # 2D 力矩 = r x F (z分量)
+        torque_from_tail = r_tail[0] * F[1] - r_tail[1] * F[0]
+
+        # 角阻尼（阻尼项）和被动恢复项（可选）
+        passive_restore_k = 0.0  # 若想要轻微被动校正，可设置为小值 0.1~0.5
+        restore_torque = -passive_restore_k * (self.orientation - math.pi/2.0)
+
+        torque = torque_from_tail + restore_torque - self.angular_damping * self.omega
+
+        # 水阻力：采用线性+二次阻力组合（更稳定）
+        v = self.velocity
+        v_norm = np.linalg.norm(v)
+        linear_drag = self.water_drag_linear * v
+        quad_drag = 0.5 * 1.0 * v * v_norm  # 0.5 * rho*A 的合并项，1.0是可调系数
+        drag = linear_drag + quad_drag
+
+        acc = (F - drag) / self.mass
+        self.velocity += acc * self.dt
+
+        # 限速
+        speed = np.linalg.norm(self.velocity)
+        if speed > self.max_speed:
+            self.velocity = (self.velocity / speed) * self.max_speed
+
+        ang_acc = torque / self.inertia
+        self.omega += ang_acc * self.dt
+        self.omega = float(np.clip(self.omega, -self.max_omega, self.max_omega))
+
+        self.position = self.position + self.velocity * self.dt
+        self.orientation += self.omega * self.dt
+        self.orientation = (self.orientation + math.pi) % (2*math.pi) - math.pi
+
+        # 更新身体中心与轨迹
+        self.body_center = self._get_body_center_global()
+        self.trajectory.append(self.body_center.copy())
+
+
+        # 计算奖励
+        reward = self._compute_reward(amplitude, bias)
+
+        # 初期快速纠偏奖励
+        if self.step_count <= 30:
+            deviation_reduction = abs(self.prev_lateral_deviation) - abs(lateral_deviation)
+            r_initial_correction = 20.0 * np.clip(deviation_reduction, 0.0, None)
+            reward += r_initial_correction
+        self.prev_lateral_deviation = lateral_deviation
+
+        terminated = self.step_count >= self.max_steps
+        truncated = False
+
+        info = {'amp': amplitude, 'bias': bias}
+        return self._get_obs(), float(reward), terminated, truncated, info
+
+    def _compute_reward(self, amplitude, bias):
+        """改进的奖励函数 - 强化纠偏和层次化激励"""
+        center_pos = self.body_center
+
+        # 横向偏差
+        lateral_deviation = center_pos[0] - self.target_line_x
+
+        # 朝向误差
+        target_orientation = -math.pi / 2.0
+        orientation_error = abs(self.orientation - target_orientation)
+        if orientation_error > math.pi:
+            orientation_error = 2 * math.pi - orientation_error
+
+        # 速度分解
+        forward_dir = np.array([math.cos(self.orientation), math.sin(self.orientation)])
+        y_direction = np.array([0.0, 1.0])
+        y_speed = self.velocity[1]
+        x_speed = self.velocity[0]
+        alignment = np.dot(forward_dir, y_direction)
+
+        # 偏差变化（判断是否在纠偏）
+        deviation_change = lateral_deviation - self.prev_lateral_deviation
+        is_correcting = (abs(lateral_deviation) > 0.05 and
+                        np.sign(lateral_deviation) != np.sign(deviation_change))
+
+        # 更新历史
+        self.prev_lateral_deviation = lateral_deviation
+
+        # ========= 改进的分层奖励 =========
+
+        # === 第1层：基础约束（总是生效）===
+
+        # 1. 横向偏差 - 使用分段惩罚
+        if abs(lateral_deviation) < 0.1:
+            # Perfect Zone: 小惩罚
+            r_lateral_pos = 1.0 * (lateral_deviation ** 2)
+        elif abs(lateral_deviation) < 0.3:
+            # Warning Zone: 中等惩罚
+            r_lateral_pos = -5.0 * (lateral_deviation ** 2)
+        else:
+            # Danger Zone: 大惩罚
+            r_lateral_pos = -15.0 * (lateral_deviation ** 2)
+
+        # 增加前几步快速纠偏奖励
+        if self.step_count < 30:  # 前30步为“快速定位期”
+        # lateral_deviation 从初始值减小 -> 奖励
+            deviation_reduction = abs(self.prev_lateral_deviation) - abs(lateral_deviation)
+            r_initial_correction = 20.0 * np.clip(deviation_reduction, 0.0, None)
+        else:
+            r_initial_correction = 0.0
+
+        # 2. 横向速度惩罚
+        r_lateral_vel = -25.0 * (x_speed ** 2)
+
+        # 3. 朝向惩罚
+        r_orientation = -25.0 * (orientation_error ** 2)
+
+        # 4. 角速度惩罚
+        r_omega = -15.0 * (self.omega ** 2)
+
+        # === 第2层：纠偏激励（偏离时才重要）===
+
+        # 5. 纠偏奖励 - 当偏离时，如果正在朝正确方向修正，给予奖励
+        # 横向速度方向对偏差的响应
+        if is_correcting: # r_correction = 15.0 * (1.0 - abs(lateral_deviation) / 0.5) # 越偏离奖励越大
+            r_correction = 15.0 * abs(deviation_change) * (1.0 - min(abs(lateral_deviation)/0.5, 1.0))
+        else:
+            r_correction = 0.0
+
+        # === 第3层：性能奖励（在约束满足时才生效）===
+
+        # 6. 前进奖励 - 只有在偏差较小时才给
+        if abs(lateral_deviation) < 0.3:
+            r_forward = 10.0 * max(0, y_speed)
+        else:
+            # r_forward = 10.0 * max(0, y_speed) * np.exp(-10*abs(lateral_deviation))  # 大偏差时降低前进奖励
+            r_forward = 10.0 * max(0, y_speed) * (1.0 - min(abs(lateral_deviation)/0.5, 1.0))
+
+        # 7. 方向对齐奖励
+        r_alignment = 8.0 * max(0, alignment)
+
+        # === 第4层：策略引导 ===
+
+        # 8. bias惩罚 - 但在需要纠偏时放宽
+        if abs(lateral_deviation) > 0.15:
+            # 偏离较大时，允许使用bias纠偏
+            r_bias_penalty = -5.0 * (bias ** 2)
+        else:
+            # 偏离小时，强烈惩罚bias
+            r_bias_penalty = -25.0 * (bias ** 2)
+
+        # 9. 能量惩罚
+        r_energy = -0.05 * ((amplitude - self.base_amplitude) ** 2)
+
+        # 10. 存活奖励
+        r_alive = 0.01
+
+        # === 第5层：Perfect Zone大额奖励 ===
+
+        # 11. Perfect Zone奖励 - 持续在内才给
+        if abs(lateral_deviation) < 0.1:
+            self.time_in_perfect_zone += 1
+            # 持续时间越长，奖励越高
+            r_perfect = 50.0 * np.exp(-15*abs(lateral_deviation))
+        else:
+            self.time_in_perfect_zone = 0
+            r_perfect = 0.0
+
+        # 12. 额外奖励：完美状态（所有指标都优秀）
+        if (abs(lateral_deviation) < 0.08 and
+            abs(x_speed) < 0.05 and
+            orientation_error < 0.15 and
+            0.3 < y_speed < 1.0):
+            r_excellence = 40.0
+        else:
+            r_excellence = 0.0
+
+        # 总奖励
+        total = (r_lateral_pos + r_lateral_vel + r_orientation + r_omega +
+                 r_correction + r_forward + r_alignment + r_bias_penalty +
+                 r_energy + r_alive + r_perfect + r_excellence + r_initial_correction)
+
+        if not np.isfinite(total):
+            total = -100.0
+        return float(total)
+
+    def get_trajectory(self):
+        return np.array(self.trajectory)
+
+    def get_body_segments(self):
+        joint_angles = self._body_wave_angles(self.base_amplitude, 0.0)
+        positions = self._body_positions(joint_angles)
+        segments = []
+
+        for i in range(len(positions)-1):
+            p1, p2 = positions[i], positions[i+1]
+            dirv = p2 - p1
+            L = np.linalg.norm(dirv)
+            if L < 1e-6:
+                dirv = np.array([1.0, 0.0])
+            else:
+                dirv = dirv / L
+            perp = np.array([-dirv[1], dirv[0]])
+
+            width_ratio = self.body_width_ratios[i]
+            width = self.max_body_width * width_ratio
+            hw = width / 2.0
+
+            corners = np.array([p1 + perp*hw, p1 - perp*hw, p2 - perp*hw, p2 + perp*hw])
+            segments.append(corners)
+
+        return segments, positions
+
+
+class ActorCritic(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_size=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim, hidden_size), nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size), nn.ReLU()
+        )
+        self.actor_mean = nn.Linear(hidden_size, action_dim)
+        self.actor_log_std = nn.Parameter(torch.zeros(1, action_dim))
+        self.critic = nn.Linear(hidden_size, 1)
+
+        for m in self.net:
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+                nn.init.constant_(m.bias, 0.0)
+        nn.init.orthogonal_(self.actor_mean.weight, gain=0.01)
+        nn.init.constant_(self.actor_mean.bias, 0.0)
+        nn.init.orthogonal_(self.critic.weight, gain=1.0)
+        nn.init.constant_(self.critic.bias, 0.0)
+
+    def forward(self, state):
+        x = self.net(state)
+        mean = torch.tanh(self.actor_mean(x))
+        std = torch.exp(torch.clamp(self.actor_log_std, -20, 2))
+        value = self.critic(x).squeeze(-1)
+        return mean, std, value
+
+    def get_action(self, state_np, deterministic=False):
+        state = torch.FloatTensor(state_np).unsqueeze(0)
+        mean, std, value = self.forward(state)
+        if deterministic:
+            action = mean
+        else:
+            dist = Normal(mean, std)
+            action = dist.sample()
+            action = torch.clamp(action, -1.0, 1.0)
+        return action.detach().numpy()[0], value.detach().numpy()[0]
+
+
+class PPOTrainer:
+    def __init__(self, env, lr=3e-4, gamma=0.99, lam=0.95, clip=0.2, epochs=10, batch_size=64):
+        self.env = env
+        sdim = env.observation_space.shape[0]
+        adim = env.action_space.shape[0]
+        self.model = ActorCritic(sdim, adim, hidden_size=128)
+        self.optim = optim.Adam(self.model.parameters(), lr=lr)
+        self.gamma = gamma
+        self.lam = lam
+        self.clip = clip
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.episode_rewards = []
+
+    def train_episode(self):
+        obs, _ = self.env.reset()
+        states, actions, rewards, values, logps = [], [], [], [], []
+
+        for step in range(self.env.max_steps):
+            action, val = self.model.get_action(obs)
+            s_t = torch.FloatTensor(obs).unsqueeze(0)
+            mean, std, _ = self.model.forward(s_t)
+            dist = Normal(mean, std)
+            logp = dist.log_prob(torch.FloatTensor(action)).sum().item()
+
+            next_obs, reward, done, truncated, info = self.env.step(action)
+            states.append(obs)
+            actions.append(action)
+            rewards.append(reward)
+            values.append(float(val))
+            logps.append(logp)
+            obs = next_obs
+            if done or truncated:
+                break
+
+        self.episode_rewards.append(sum(rewards))
+
+        # GAE计算
+        advantages = []
+        gae = 0.0
+        values = values + [0.0]
+        for t in reversed(range(len(rewards))):
+            delta = rewards[t] + self.gamma * values[t+1] - values[t]
+            gae = delta + self.gamma * self.lam * gae
+            advantages.insert(0, gae)
+
+        advantages = torch.FloatTensor(advantages)
+        if len(advantages) == 0 or torch.isnan(advantages).any():
+            return self.episode_rewards[-1]
+
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        states_t = torch.FloatTensor(np.array(states))
+        actions_t = torch.FloatTensor(np.array(actions))
+        old_logps_t = torch.FloatTensor(np.array(logps))
+        returns = advantages + torch.FloatTensor([values[i] for i in range(len(advantages))])
+
+        dataset = torch.utils.data.TensorDataset(states_t, actions_t, advantages, old_logps_t, returns)
+        loader = torch.utils.data.DataLoader(dataset, batch_size=min(self.batch_size, len(states_t)), shuffle=True)
+
+        for _ in range(self.epochs):
+            for s_batch, a_batch, adv_batch, old_log_batch, ret_batch in loader:
+                mean, std, valpred = self.model.forward(s_batch)
+                if torch.isnan(mean).any() or torch.isnan(std).any():
+                    continue
+
+                dist = Normal(mean, std)
+                new_logp = dist.log_prob(a_batch).sum(dim=-1)
+                ratio = torch.exp(new_logp - old_log_batch)
+
+                surr1 = ratio * adv_batch
+                surr2 = torch.clamp(ratio, 1.0 - self.clip, 1.0 + self.clip) * adv_batch
+                loss_actor = -torch.min(surr1, surr2).mean()
+                loss_critic = 0.5 * ((valpred.squeeze() - ret_batch) ** 2).mean()
+                loss_entropy = -0.01 * dist.entropy().mean()
+                loss = loss_actor + loss_critic + loss_entropy
+
+                self.optim.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+                self.optim.step()
+
+        return self.episode_rewards[-1]
+
+
+def calculate_straightness_metrics(trajectory):
+    """计算直线度指标"""
+    if len(trajectory) < 2:
+        return 0.0, 0.0, 0.0
+
+    x_coords = trajectory[:, 0]
+    lateral_deviations = np.abs(x_coords)
+
+    mean_deviation = np.mean(lateral_deviations[10:])
+    max_deviation = np.max(lateral_deviations[10:])
+
+    forward_distance = abs(trajectory[-1, 1] - trajectory[0, 1])
+
+    return mean_deviation, max_deviation, forward_distance
+
+
+def create_animation(env, model, filename):
+    obs, _ = env.reset()
+    positions = []
+    segments_hist = []
+    frames = env.max_steps
+
+    for i in range(frames):
+        action, _ = model.get_action(obs, deterministic=True)
+        obs, _, done, _, _ = env.step(action)
+        positions.append(env.body_center.copy())
+        segs, _ = env.get_body_segments()
+        segments_hist.append(segs)
+        if done:
+            break
+
+    positions = np.array(positions)
+
+    fig, ax = plt.subplots(figsize=(8, 14))
+    ax.set_facecolor('#f7fbff')
+
+    y_max = max(10.0, positions[-1, 1] + 1.0) if len(positions) > 0 else 10.0
+    ax.set_xlim(-1.5, 1.5)
+    ax.set_ylim(-y_max, 2)
+
+    def update(frame):
+        ax.clear()
+
+        # 绘制目标直线和区域
+        ax.axvline(x=0.0, color='g', linestyle='--', linewidth=2, label='Target Line')
+        ax.axvspan(-0.1, 0.1, alpha=0.2, color='green', label='Perfect Zone')
+        ax.axvspan(-0.3, -0.1, alpha=0.1, color='yellow')
+        ax.axvspan(0.1, 0.3, alpha=0.1, color='yellow')
+
+        # 绘制轨迹
+        if frame > 2:
+            traj = positions[:frame+1]
+            ax.plot(traj[:, 0], traj[:, 1], 'b-', linewidth=2.0, alpha=0.7, label='Trajectory')
+
+        # 绘制鱼体
+        if frame < len(segments_hist):
+            segs = segments_hist[frame]
+            colors = plt.cm.Blues(np.linspace(0.4, 0.9, len(segs)))
+            for i, seg in enumerate(segs):
+                ax.add_patch(Polygon(seg, facecolor=colors[i], edgecolor='navy', linewidth=1.5))
+
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.3, linestyle='--')
+        ax.legend(loc='upper right')
+
+        if frame < len(positions):
+            current_x = positions[frame, 0]
+            current_y = positions[frame, 1]
+            ax.set_title(f"Straight Line Swimming\nStep {frame+1}/{frames}\nX={current_x:.3f}m, Y={current_y:.3f}m",
+                         fontsize=11)
+
+        ax.set_xlim(-1.5, 1.5)
+        ax.set_ylim(-y_max, 2)
+        return []
+
+    anim = animation.FuncAnimation(fig, update, frames=len(positions), interval=50, blit=True)
+    anim.save(filename, writer='pillow', fps=20)
+    plt.close()
+    print(f"Animation saved to {filename}")
+
+
+def plot_training_results(trainer, results, checkpoints):
+    """生成训练效果可视化图表"""
+
+    # 图1: 训练曲线
+    plt.figure(figsize=(12, 5))
+
+    plt.subplot(1, 2, 1)
+    rewards = trainer.episode_rewards
+    episodes = range(1, len(rewards) + 1)
+    plt.plot(episodes, rewards, alpha=0.3, color='steelblue', linewidth=0.5)
+
+    window = 20
+    if len(rewards) >= window:
+        moving_avg = np.convolve(rewards, np.ones(window)/window, mode='valid')
+        plt.plot(range(window, len(rewards)+1), moving_avg,
+                color='darkblue', linewidth=2, label=f'{window}-Episode Moving Average')
+
+    for cp in checkpoints:
+        if cp <= len(rewards):
+            plt.axvline(x=cp, color='red', linestyle='--', alpha=0.5, linewidth=1)
+            plt.text(cp, plt.ylim()[1]*0.95, f'CP{cp}',
+                    rotation=90, verticalalignment='top', fontsize=8)
+
+    plt.xlabel('Episode', fontsize=11)
+    plt.ylabel('Total Reward', fontsize=11)
+    plt.title('Training Progress: Episode Rewards', fontsize=12, fontweight='bold')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+
+    plt.subplot(1, 2, 2)
+    last_50 = rewards[-50:] if len(rewards) >= 50 else rewards
+    plt.hist(last_50, bins=20, color='steelblue', alpha=0.7, edgecolor='black')
+    plt.axvline(x=np.mean(last_50), color='red', linestyle='--',
+                linewidth=2, label=f'Mean: {np.mean(last_50):.1f}')
+    plt.xlabel('Episode Reward', fontsize=11)
+    plt.ylabel('Frequency', fontsize=11)
+    plt.title('Reward Distribution (Last 50 Episodes)', fontsize=12, fontweight='bold')
+    plt.legend()
+    plt.grid(True, alpha=0.3, axis='y')
+
+    plt.tight_layout()
+    plt.savefig('outputs/straight_fig1_training_curve.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    print("✓ Figure 1 saved: outputs/straight_fig1_training_curve.png")
+
+
+    # 图2: 性能指标对比
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+    cps = list(results.keys())
+    mean_devs = [results[cp]['mean_deviation'] for cp in cps]
+    max_devs = [results[cp]['max_deviation'] for cp in cps]
+    forward_dists = [results[cp]['forward_distance'] for cp in cps]
+
+    ax1 = axes[0]
+    bars1 = ax1.bar(range(len(cps)), mean_devs, color='coral', alpha=0.8, edgecolor='black')
+    ax1.axhline(y=0.15, color='green', linestyle='--', linewidth=2, label='Target: <0.15m')
+    ax1.set_xlabel('Training Episodes', fontsize=11)
+    ax1.set_ylabel('Mean Lateral Deviation (m)', fontsize=11)
+    ax1.set_title('Average Deviation from Center Line', fontsize=12, fontweight='bold')
+    ax1.set_xticks(range(len(cps)))
+    ax1.set_xticklabels([f'EP{cp}' for cp in cps])
+    ax1.legend()
+    ax1.grid(True, alpha=0.3, axis='y')
+
+    for i, (bar, val) in enumerate(zip(bars1, mean_devs)):
+        height = bar.get_height()
+        ax1.text(bar.get_x() + bar.get_width()/2., height,
+                f'{val:.3f}m', ha='center', va='bottom', fontsize=9)
+
+    ax2 = axes[1]
+    bars2 = ax2.bar(range(len(cps)), max_devs, color='skyblue', alpha=0.8, edgecolor='black')
+    ax2.axhline(y=0.3, color='orange', linestyle='--', linewidth=2, label='Target: <0.3m')
+    ax2.set_xlabel('Training Episodes', fontsize=11)
+    ax2.set_ylabel('Max Lateral Deviation (m)', fontsize=11)
+    ax2.set_title('Maximum Deviation from Center Line', fontsize=12, fontweight='bold')
+    ax2.set_xticks(range(len(cps)))
+    ax2.set_xticklabels([f'EP{cp}' for cp in cps])
+    ax2.legend()
+    ax2.grid(True, alpha=0.3, axis='y')
+
+    for i, (bar, val) in enumerate(zip(bars2, max_devs)):
+        height = bar.get_height()
+        ax2.text(bar.get_x() + bar.get_width()/2., height,
+                f'{val:.3f}m', ha='center', va='bottom', fontsize=9)
+
+    ax3 = axes[2]
+    bars3 = ax3.bar(range(len(cps)), forward_dists, color='lightgreen', alpha=0.8, edgecolor='black')
+    ax3.axhline(y=5.0, color='blue', linestyle='--', linewidth=2, label='Target: >5.0m')
+    ax3.set_xlabel('Training Episodes', fontsize=11)
+    ax3.set_ylabel('Forward Distance (m)', fontsize=11)
+    ax3.set_title('Swimming Distance Achieved', fontsize=12, fontweight='bold')
+    ax3.set_xticks(range(len(cps)))
+    ax3.set_xticklabels([f'EP{cp}' for cp in cps])
+    ax3.legend()
+    ax3.grid(True, alpha=0.3, axis='y')
+
+    for i, (bar, val) in enumerate(zip(bars3, forward_dists)):
+        height = bar.get_height()
+        ax3.text(bar.get_x() + bar.get_width()/2., height,
+                f'{val:.2f}m', ha='center', va='bottom', fontsize=9)
+
+    plt.tight_layout()
+    plt.savefig('outputs/straight_fig2_performance_metrics.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    print("✓ Figure 2 saved: outputs/straight_fig2_performance_metrics.png")
+
+
+    # 图3: 轨迹对比
+    fig, axes = plt.subplots(1, 2, figsize=(14, 10))
+
+    # 早期模型
+    early_env = StraightLineFishEnv(num_segments=5, body_length=0.8)
+    early_trajectories = []
+    for _ in range(3):
+        obs, _ = early_env.reset()
+        for _ in range(300):
+            action = early_env.action_space.sample() * 0.3
+            obs, _, done, truncated, _ = early_env.step(action)
+            if done or truncated:
+                break
+        early_trajectories.append(early_env.get_trajectory())
+
+    # 最终模型
+    final_env = StraightLineFishEnv(num_segments=5, body_length=0.8)
+    final_trajectories = []
+    for _ in range(3):
+        obs, _ = final_env.reset()
+        for _ in range(500):
+            action, _ = trainer.model.get_action(obs, deterministic=True)
+            obs, _, done, truncated, _ = final_env.step(action)
+            if done or truncated:
+                break
+        final_trajectories.append(final_env.get_trajectory())
+
+    # 绘制早期轨迹
+    ax1 = axes[0]
+    colors_early = ['#ff6b6b', '#ee5a6f', '#c44569']
+    for i, traj in enumerate(early_trajectories):
+        ax1.plot(traj[:, 0], traj[:, 1], color=colors_early[i],
+                linewidth=2, alpha=0.7, label=f'Trial {i+1}')
+
+    ax1.axvline(x=0.0, color='green', linestyle='--', linewidth=2, label='Target Line')
+    ax1.axvspan(-0.1, 0.1, alpha=0.2, color='green', label='Perfect Zone')
+    ax1.axvspan(-0.3, -0.1, alpha=0.1, color='yellow')
+    ax1.axvspan(0.1, 0.3, alpha=0.1, color='yellow')
+    ax1.set_xlim(-1.0, 1.0)
+    ax1.set_ylim(-12, 1.0)
+    ax1.set_xlabel('X Position (m)', fontsize=11)
+    ax1.set_ylabel('Y Position (m)', fontsize=11)
+    ax1.set_title('Early Training (Random Policy)', fontsize=12, fontweight='bold')
+    ax1.legend(loc='upper right', fontsize=9)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_aspect('equal', adjustable='box')
+
+    # 绘制最终轨迹
+    ax2 = axes[1]
+    colors_final = ['#4ecdc4', '#45b7d1', '#3d8bae']
+    for i, traj in enumerate(final_trajectories):
+        ax2.plot(traj[:, 0], traj[:, 1], color=colors_final[i],
+                linewidth=2, alpha=0.7, label=f'Trial {i+1}')
+
+    ax2.axvline(x=0.0, color='green', linestyle='--', linewidth=2, label='Target Line')
+    ax2.axvspan(-0.1, 0.1, alpha=0.2, color='green', label='Perfect Zone')
+    ax2.axvspan(-0.3, -0.1, alpha=0.1, color='yellow')
+    ax2.axvspan(0.1, 0.3, alpha=0.1, color='yellow')
+    ax2.set_xlim(-1.0, 1.0)
+    ax2.set_ylim(-12, 1.0)
+    ax2.set_xlabel('X Position (m)', fontsize=11)
+    ax2.set_ylabel('Y Position (m)', fontsize=11)
+    ax2.set_title(f'Final Training (EP{checkpoints[-1]})', fontsize=12, fontweight='bold')
+    ax2.legend(loc='upper right', fontsize=9)
+    ax2.grid(True, alpha=0.3)
+    ax2.set_aspect('equal', adjustable='box')
+
+    plt.tight_layout()
+    plt.savefig('outputs/straight_fig3_trajectory_comparison.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    print("✓ Figure 3 saved: outputs/straight_fig3_trajectory_comparison.png")
+
+
+def main():
+    print()
+
+    env = StraightLineFishEnv(num_segments=5, body_length=0.8)
+    trainer = PPOTrainer(env, lr=3e-4, epochs=10, batch_size=64)
+
+    checkpoints = [5, 30, 50, 100, 150, 300]
+    results = {}
+
+    for i, cp in enumerate(checkpoints):
+        to_train = cp if i == 0 else (cp - checkpoints[i-1])
+        print(f"\n{'='*60}")
+        print(f"Training for {to_train} episodes (Total: {cp})")
+        print(f"{'='*60}")
+
+        for ep in range(to_train):
+            reward = trainer.train_episode()
+            if (ep + 1) % 10 == 0:
+                recent_rewards = trainer.episode_rewards[-10:]
+                avg = np.mean(recent_rewards)
+                std = np.std(recent_rewards)
+                print(f"Ep {len(trainer.episode_rewards):4d}: avg={avg:7.2f}, std={std:6.2f}, cur={reward:7.2f}")
+
+        gif = f'outputs/fish_straight_improved_ep_{cp}.gif'
+        print(f"\nGenerating animation: {gif}")
+        anim_env = StraightLineFishEnv(num_segments=5, body_length=0.8)
+        create_animation(anim_env, trainer.model, gif)
+
+        print("\nTesting straightness metrics...")
+        mean_devs, max_devs, forward_dists = [], [], []
+
+        for test_id in range(5):
+            test_env = StraightLineFishEnv(num_segments=5, body_length=0.8)
+            obs, _ = test_env.reset()
+            for _ in range(500):
+                action, _ = trainer.model.get_action(obs, deterministic=True)
+                obs, _, done, truncated, _ = test_env.step(action)
+                if done or truncated:
+                    break
+
+            traj = test_env.get_trajectory()
+            mean_dev, max_dev, forward_dist = calculate_straightness_metrics(traj)
+            mean_devs.append(mean_dev)
+            max_devs.append(max_dev)
+            forward_dists.append(forward_dist)
+
+        results[cp] = {
+            'mean_deviation': float(np.mean(mean_devs)),
+            'max_deviation': float(np.mean(max_devs)),
+            'forward_distance': float(np.mean(forward_dists))
+        }
+
+        print(f"\n✓ Checkpoint {cp} Results:")
+        print(f"  平均横向偏差: {results[cp]['mean_deviation']:.3f}m")
+        print(f"  最大横向偏差: {results[cp]['max_deviation']:.3f}m")
+        print(f"  前进距离: {results[cp]['forward_distance']:.3f}m")
+
+    print("\n" + "="*60)
+    print("=== 最终训练结果总结 ===")
+    print("="*60)
+    for cp, res in results.items():
+        print(f"Checkpoint {cp:3d}:")
+        print(f"  平均横向偏差: {res['mean_deviation']:.3f}m (目标: <0.15m)")
+        print(f"  最大横向偏差: {res['max_deviation']:.3f}m (目标: <0.3m)")
+        print(f"  前进距离: {res['forward_distance']:.3f}m (目标: >5.0m)")
+        print()
+
+    print("="*60)
+    print("训练完成！")
+    print("="*60)
+
+    final_result = results[checkpoints[-1]]
+    if final_result['forward_distance'] > 5.0 and final_result['mean_deviation'] < 0.15:
+        print("\n✅ 优秀！机器鱼能保持完美直线游动！")
+    elif final_result['forward_distance'] > 3.0 and final_result['mean_deviation'] < 0.3:
+        print("\n✓ 良好！机器鱼能较好地保持直线游动。")
+    elif final_result['forward_distance'] > 1.0:
+        print("\n⚠️  一般。机器鱼能前进但偏离较多。")
+    else:
+        print("\n❌ 需要进一步调整参数。")
+
+    return trainer, results, checkpoints
+
+
+if __name__ == "__main__":
+    trainer, results, checkpoints = main()
+
+    # 生成可视化图表
+    print("\n" + "="*60)
+    print("生成训练效果可视化图表...")
+    print("="*60)
+    plot_training_results(trainer, results, checkpoints)
+
+    print("\n" + "="*60)
+    print("✅ 所有可视化图表已生成！")
+    print("="*60)
+    print("生成的文件：")
+    print("  📊 outputs/straight_fig1_training_curve.png (训练曲线)")
+    print("  📊 outputs/straight_fig2_performance_metrics.png (性能指标)")
+    print("  📊 outputs/straight_fig3_trajectory_comparison.png (轨迹对比)")
+    print("  🎬 outputs/fish_straight_improved_ep_*.gif (动画)")
+    print("="*60)
